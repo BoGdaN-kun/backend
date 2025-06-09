@@ -10,10 +10,55 @@ from StockExchangeSimualtor.database import db
 from StockExchangeSimualtor.Models.Order import Order, OrderTypeEnum, OrderStatusEnum, SideEnum
 from StockExchangeSimualtor.Models.Trade import Trade
 from StockExchangeSimualtor.Models.Positions import Position
+from flask import current_app, request as flask_request
 
+USER_SERVICE_URL = "http://localhost:5000"
+
+def _update_cash_balance(user_id: int, amount_cents: int, action: str):
+    """
+    Calls the user service to update a user's cash balance.
+    :param user_id: The ID of the user whose balance will change.
+    :param amount_cents: The amount in cents to deposit or withdraw. Must be positive.
+    :param action: Either 'deposit' or 'withdraw'.
+    """
+    if action not in ['deposit', 'withdraw']:
+        raise ValueError("Invalid action for cash update.")
+
+    # To make an authenticated request, we need the user's JWT.
+    # We can get it from the header of the original request that came to the exchange.
+    auth_header = flask_request.headers.get('Authorization')
+    if not auth_header:
+        # This is a critical failure. If the exchange accepted a trade without a token,
+        # it cannot update cash. This indicates a potential security gap.
+        current_app.logger.error(f"Cannot update cash for user {user_id}: Authorization header is missing in the original request.")
+        raise RuntimeError("Missing Authorization for inter-service communication.")
+
+    headers = {
+        "Authorization": auth_header,
+        "Content-Type": "application/json"
+    }
+    payload = {"amount": amount_cents / 100.0} # The account service expects amount in dollars
+    endpoint = f"{USER_SERVICE_URL}/account/{action}"
+
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers)
+        response.raise_for_status() # Raise an exception for HTTP error codes (4xx or 5xx)
+        current_app.logger.info(f"Successfully posted {action} of ${payload['amount']:.2f} for user_id {user_id}")
+    except requests.exceptions.RequestException as e:
+        # If the API call fails, this is a major problem. It means shares were traded
+        # but cash was not updated. This is a "distributed transaction" problem.
+        # For now, we log a critical error. In a production system, this would trigger
+        # a retry mechanism or an alert for manual intervention.
+        current_app.logger.critical(
+            f"FAILED to {action} cash for user_id {user_id}. Amount: {payload['amount']}. Error: {e}. "
+            f"Response: {e.response.text if e.response else 'N/A'}. "
+            "SYSTEM IS IN AN INCONSISTENT STATE!"
+        )
+        # Re-raising the error will cause the database transaction in the matching engine to roll back.
+        # This is the safest default behavior: if cash can't be updated, the trade shouldn't be finalized.
+        raise RuntimeError("Failed to update user cash balance.")
 
 def fetch_latest_price(symbol: str) -> int:
-    # ... (no changes needed here)
     url = current_app.config["MARKET_FEED_URL"]
     resp = requests.get(url)
     if resp.status_code != 200:
@@ -53,10 +98,12 @@ def execute_market_order(order: Order):
 
         if order.side == SideEnum.BUY:
             if not pos:
-                pos = Position(user_id=order.user_id, symbol=order.symbol, quantity=0)
+                pos = Position(user_id=order.user_id, symbol=order.symbol, quantity=0, total_cost_cents=0)
                 db.session.add(pos)
             pos.quantity += fill_qty
-            # TODO: Debit actual cash from user's account (lock account, update balance)
+            pos.total_cost_cents += fill_qty * price_cents
+            # TODO: Debit actual cash from user's account (lock account, update balance) - done
+            _update_cash_balance(order.user_id, fill_qty * price_cents, 'withdraw')
         else:  # SELL
             if not pos or pos.quantity < fill_qty:
                 # This check should ideally not fail if place_order was correct,
@@ -65,8 +112,17 @@ def execute_market_order(order: Order):
                 current_app.logger.error(
                     f"Market SELL order {order.id}: Insufficient shares ({pos.quantity if pos else 0}) for {fill_qty} of {order.symbol}")
                 raise RuntimeError(f"Insufficient shares for market SELL of {order.symbol}")
+            if pos.quantity > 0:  # Ensure no division by zero if quantity is already 0 (should be caught by earlier check)
+                average_cost_at_sale_cents = pos.total_cost_cents / pos.quantity
+                cost_of_goods_sold_cents = fill_qty * average_cost_at_sale_cents
+                pos.total_cost_cents -= int(round(cost_of_goods_sold_cents))
+            else:  # Should ideally not happen if pos.quantity < fill_qty check is robust
+                pos.total_cost_cents = 0
             pos.quantity -= fill_qty
-            # TODO: Credit cash to user's account (lock account, update balance)
+            if pos.quantity == 0:
+                pos.total_cost_cents = 0  # Reset cost if all shares sold
+            # TODO: Credit cash to user's account (lock account, update balance) - DONE
+            _update_cash_balance(order.user_id, fill_qty * price_cents, 'deposit')
 
         db.session.commit()  # Commit all changes (Trade, Order status, Position)
     except Exception as e:
@@ -146,18 +202,29 @@ def match_limit_order(incoming: Order):
                 raise RuntimeError(
                     f"Seller {sell_order.user_id} (order {sell_order.id}) has insufficient shares for fill quantity {fill_qty}")
 
+            trade_value_cents = fill_qty * executed_price_cents
             # Update Buyer's Position
             if not buyer_pos:
-                buyer_pos = Position(user_id=buy_order.user_id, symbol=incoming.symbol, quantity=0)
+                buyer_pos = Position(user_id=buy_order.user_id, symbol=incoming.symbol, quantity=0,total_cost_cents=0)
                 db.session.add(buyer_pos)
             buyer_pos.quantity += fill_qty
+            buyer_pos.total_cost_cents += fill_qty * executed_price_cents
             # TODO: Debit/reserve cash for buyer
-
+            _update_cash_balance(buyer_pos.user_id, trade_value_cents, 'withdraw')
             # Update Seller's Position
             # (seller_pos is already fetched and validated above)
+            # Around line 123, before seller_pos.quantity -= fill_qty
+            if seller_pos.quantity > 0:  # Should be true because of the check: `not seller_pos or seller_pos.quantity < fill_qty`
+                average_cost_at_sale_cents = seller_pos.total_cost_cents / seller_pos.quantity
+                cost_of_goods_sold_cents = fill_qty * average_cost_at_sale_cents
+                seller_pos.total_cost_cents -= int(round(cost_of_goods_sold_cents))
+            else:  # Should not be reached if the earlier check correctly raises an error
+                seller_pos.total_cost_cents = 0
             seller_pos.quantity -= fill_qty
+            if seller_pos.quantity == 0:
+                seller_pos.total_cost_cents = 0  # Reset cost if all shares sold
             # TODO: Credit cash to seller
-
+            _update_cash_balance(seller_pos.user_id, trade_value_cents, 'deposit')
             # Update orders
             buy_order.filled_quantity += fill_qty
             sell_order.filled_quantity += fill_qty
