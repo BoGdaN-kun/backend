@@ -1,0 +1,225 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import datetime
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
+# Read the data from the csv file
+pd.set_option('display.float_format', lambda x: '%.16f' % x)
+df = pd.read_csv('apple_adj.csv')
+
+df = df[['Date', 'Adj Close']]
+df['Date'] = pd.to_datetime(df['Date'])
+df.index = df.pop('Date')
+
+# Plot the closing prices
+plt.figure(figsize=(10, 6))
+plt.plot(df.index, df['Adj Close'], label='AAPL Close Price')
+plt.title('Apple Close Price History')
+plt.xlabel('Date')
+plt.ylabel('Close Price')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+def str_to_datetime(s):
+    split = s.split('-')
+    year, month, day = int(split[0]), int(split[1]), int(split[2])
+    return datetime.datetime(year=year, month=month, day=day)
+
+def df_to_windowed_df(dataframe, first_date_str, last_date_str, n=3):
+    first_date = str_to_datetime(first_date_str)
+    last_date = str_to_datetime(last_date_str)
+
+    target_date = first_date
+    
+    dates = []
+    X, Y = [], []
+
+    last_time = False
+    while True:
+        df_subset = dataframe.loc[:target_date].tail(n+1)
+        
+        if len(df_subset) != n+1:
+            print(f'Error: Window of size {n} is too large for date {target_date}')
+            return
+
+        values = df_subset['Adj Close'].to_numpy()
+        x, y = values[:-1], values[-1]
+
+        dates.append(target_date)
+        X.append(x)
+        Y.append(y)
+
+        next_week = dataframe.loc[target_date:target_date+datetime.timedelta(days=7)]
+        if len(next_week.head(2).tail(1).index.values) == 0:
+            break 
+        
+        next_datetime_str = str(next_week.head(2).tail(1).index.values[0])
+        next_date_str = next_datetime_str.split('T')[0]
+        year_month_day = next_date_str.split('-')
+        year, month, day = year_month_day
+        next_date = datetime.datetime(day=int(day), month=int(month), year=int(year))
+        
+        if last_time:
+            break
+        
+        target_date = next_date
+
+        if target_date >= last_date: 
+            last_time = True
+        
+    ret_df = pd.DataFrame({})
+    ret_df['Target Date'] = dates
+    
+    X = np.array(X)
+    for i in range(0, n):
+        ret_df[f'Target-{n-i}'] = X[:, i]
+    
+    ret_df['Target'] = Y
+
+    return ret_df
+
+
+
+
+
+windowed_df = df_to_windowed_df(df, 
+                                 '2018-12-17', 
+                                 '2023-05-20',
+                                 n=3)
+print(windowed_df.head())
+
+def df_to_windowed_numpy(windowed_df):
+    df_as_numpy = windowed_df.to_numpy()
+    dates = df_as_numpy[:, 0]
+    middle_matrix = df_as_numpy[:, 1:-1]
+    targets = df_as_numpy[:, -1]
+
+    X = middle_matrix.reshape((len(dates), middle_matrix.shape[1], 1))
+    Y = targets
+    return dates, X.astype(np.float32), Y.astype(np.float32)
+
+dates, X, Y = df_to_windowed_numpy(windowed_df)
+
+q_80 = int(len(dates) * 0.6)
+q_90 = int(len(dates) * 0.8)
+
+dates_train, X_train, Y_train = dates[:q_80], X[:q_80], Y[:q_80]
+dates_val, X_val, Y_val = dates[q_80:q_90], X[q_80:q_90], Y[q_80:q_90]
+dates_test, X_test, Y_test = dates[q_90:], X[q_90:], Y[q_90:]
+
+plt.figure(figsize=(10, 6))
+plt.plot(dates_train, Y_train, label='Train')
+plt.plot(dates_val, Y_val, label='Validation')
+plt.plot(dates_test, Y_test, label='Test')
+plt.title('Data Split for Training, Validation, and Test')
+plt.xlabel('Date')
+plt.ylabel('Close Price')
+plt.legend(['Train', 'Validation', 'Test'])
+plt.grid(True)
+plt.show()
+
+
+X_train_t = torch.from_numpy(X_train)
+Y_train_t = torch.from_numpy(Y_train).unsqueeze(1) 
+X_val_t = torch.from_numpy(X_val)
+Y_val_t = torch.from_numpy(Y_val).unsqueeze(1)
+X_test_t = torch.from_numpy(X_test)
+Y_test_t = torch.from_numpy(Y_test).unsqueeze(1)
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size,num_layers=2,dropout=0.2, bidirectional=True):
+        super(LSTMModel, self).__init__()
+        
+        self.lstm = nn.LSTM(input_size,
+                            hidden_size,
+                            batch_first=True,
+                            num_layers=num_layers,
+                            dropout=dropout if num_layers>1 else 0.0,
+                            bidirectional=bidirectional)
+        self.hidden_size   = hidden_size
+        self.num_layers    = num_layers
+        self.bidirectional = bidirectional
+        feat = hidden_size * (2 if bidirectional else 1)
+        self.fc = nn.Sequential(
+            nn.Linear(feat, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, output_size)
+        )
+        
+
+    def forward(self, x):
+            batch_size     = x.size(0)
+            num_directions = 2 if self.bidirectional else 1
+            total_layers   = self.num_layers * num_directions
+
+            # Correct hidden & cell state shapes:
+            h0 = torch.zeros(total_layers, batch_size, self.hidden_size, device=x.device)
+            c0 = torch.zeros(total_layers, batch_size, self.hidden_size, device=x.device)
+
+            out, _ = self.lstm(x, (h0, c0))
+            last = out[:, -1, :]   # (batch, feat_dim)
+            return self.fc(last)
+
+# Model parameters
+input_size = X_train_t.shape[-1] # Number of features per time step  -====-=== Close price
+hidden_size = 64 #  hidden units
+output_size = 1 # 
+
+model = LSTMModel(input_size, hidden_size, output_size)
+
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.0001)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+X_train_t = X_train_t.to(device)
+Y_train_t = Y_train_t.to(device)
+X_val_t = X_val_t.to(device)
+Y_val_t = Y_val_t.to(device)
+X_test_t = X_test_t.to(device)
+Y_test_t = Y_test_t.to(device)
+batch_size = 32 
+train_dataset = TensorDataset(X_train_t, Y_train_t)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+val_dataset = TensorDataset(X_val_t, Y_val_t)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+
+epochs = 200
+for epoch in range(epochs):
+    model.train() 
+    running_loss = 0.0
+    for inputs, labels in train_loader:
+        optimizer.zero_grad() 
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward() 
+        optimizer.step() 
+        running_loss += loss.item() * inputs.size(0)
+    
+    epoch_loss = running_loss / len(train_loader.dataset)
+
+
+    model.eval() 
+    val_running_loss = 0.0
+    with torch.no_grad(): 
+        for inputs, labels in val_loader:
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            val_running_loss += loss.item() * inputs.size(0)
+    
+    val_epoch_loss = val_running_loss / len(val_loader.dataset)
+    
+    if (epoch + 1) % 10 == 0:
+        print(f'Epoch [{epoch+1}/{epochs}], Train Loss: {epoch_loss:.4f}, Val Loss: {val_epoch_loss:.4f}')
+
+print('Training Finished!')

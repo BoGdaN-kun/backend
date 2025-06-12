@@ -1,0 +1,277 @@
+import pandas as pd
+import numpy as np
+import datetime
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import scipy
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+
+price_df_full = pd.read_csv('apple_adj.csv', parse_dates=['Date']).set_index('Date')
+price_df = price_df_full[['Adj Close', 'Volume']].copy()
+
+price_df.rename(columns={'Adj Close': 'Close'}, inplace=True)
+
+#Simple Moving Average (SMA) feature 10 days
+price_df['SMA_10'] = price_df['Close'].rolling(window=10).mean()
+
+# load news data
+print("Loading and processing news data...")
+news_df = pd.read_csv('E:\\LLM\\appleNewsSentiment\\AppleNewsStock.csv', parse_dates=['Date'])
+
+#load FinBERT model
+tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+model.eval()
+
+# Compute sentiment for each news headline
+def batch_sentiment(texts):
+    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
+    with torch.no_grad():
+        logits = model(**inputs).logits.cpu().numpy()
+    probs = scipy.special.softmax(logits, axis=1)
+    neg, neu, pos = probs[:,0], probs[:,1], probs[:,2]
+    comp = pos - neg
+    return np.stack([neg, neu, pos, comp], axis=1)
+
+# Per day aggregation of sentiment scores
+daily = []
+for date, grp in news_df.groupby('Date'):
+    texts = [t for t in grp['News'].tolist() if isinstance(t, str) and t.strip()]
+    if not texts:
+        neg = neu = pos = comp = 0.0
+    else:
+        arr = batch_sentiment(texts)
+        neg, neu, pos, comp = arr.mean(axis=0)
+    daily.append((date, neg, neu, pos, comp))
+
+sent_df = pd.DataFrame(daily, columns=['Date', 'neg', 'neu', 'pos', 'comp'])
+sent_df.set_index('Date', inplace=True)
+
+# join the price and sentiment data => finalllll Features/Target 
+df = price_df.join(sent_df, how='left')
+
+# Calculate the daily return 
+df['Return'] = df['Close'].pct_change()
+
+df.dropna(inplace=True)
+
+FEATURE_COLS = ['Close', 'Volume', 'SMA_10', 'neg', 'neu', 'pos', 'comp']
+TARGET_COL = 'Return'
+
+df = df[FEATURE_COLS + [TARGET_COL]]
+
+print("Feature engineering complete. Final DataFrame columns:")
+print(df.head())
+
+
+# -
+def window_df(df, n=10):
+    Xs, Ys, dates = [], [], []
+    
+    #return_col_idx = df.columns.get_loc(TARGET_COL)
+    
+    for i in range(n, len(df)):
+        # Input features are the window of 'n' days
+        x_window = df.iloc[i-n:i][FEATURE_COLS].to_numpy()
+
+        # Target is the return on the current day 'i'
+        y_target = df.iloc[i][TARGET_COL]
+        
+        Xs.append(x_window)
+        Ys.append(y_target)
+        dates.append(df.index[i])
+
+    X = np.stack(Xs).astype(np.float32)
+    Y = np.array(Ys, dtype=np.float32).reshape(-1, 1)
+    return np.array(dates), X, Y
+
+
+dates, X, Y = window_df(df, n=4)
+
+
+train_end_index = int(0.70 * len(dates))
+val_end_index = int(0.85 * len(dates))
+
+X_tr_raw, Y_tr = X[:train_end_index], Y[:train_end_index]
+X_v_raw,  Y_v  = X[train_end_index:val_end_index], Y[train_end_index:val_end_index]
+X_te_raw, Y_te = X[val_end_index:], Y[val_end_index:]
+
+#Scale the input features
+scaler = StandardScaler()
+df[FEATURE_COLS] = scaler.fit_transform(df[FEATURE_COLS])
+num_samples, num_timesteps, num_features = X_tr_raw.shape
+X_tr_reshaped = X_tr_raw.reshape(-1, num_features)
+scaler.fit(X_tr_reshaped)
+
+
+X_tr = scaler.transform(X_tr_reshaped).reshape(num_samples, num_timesteps, num_features)
+
+X_v = scaler.transform(X_v_raw.reshape(-1, num_features)).reshape(X_v_raw.shape)
+X_te = scaler.transform(X_te_raw.reshape(-1, num_features)).reshape(X_te_raw.shape)
+
+
+print(f"Training set size: {len(X_tr)} samples")
+print(f"Validation set size: {len(X_v)} samples")
+print(f"Test set size: {len(X_te)} samples")
+
+
+
+# Convert to  Tensors
+X_tr_t, Y_tr_t = torch.from_numpy(X_tr).to(device), torch.from_numpy(Y_tr).to(device)
+X_v_t,  Y_v_t  = torch.from_numpy(X_v).to(device),  torch.from_numpy(Y_v).to(device)
+X_te_t, Y_te_t = torch.from_numpy(X_te).to(device), torch.from_numpy(Y_te).to(device)
+
+# Create TensorDatasets
+train_ds = TensorDataset(X_tr_t, Y_tr_t)
+val_ds   = TensorDataset(X_v_t,  Y_v_t)
+test_ds  = TensorDataset(X_te_t, Y_te_t)
+
+# Create DataLoaders
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+val_loader   = DataLoader(val_ds,   batch_size=32, shuffle=False)
+test_loader  = DataLoader(test_ds,  batch_size=32, shuffle=False)
+
+class TwoStreamFusion(nn.Module):
+    def __init__(self,
+                 price_input_size,
+                 sent_input_size,
+                 lstm_hidden=32,
+                 dense_hidden=32,
+                 dropout=0.5,
+                 num_lstm_layers=1,
+                 bidirectional=False):
+        super().__init__()
+        
+        self.price_input_size = price_input_size
+        self.sent_input_size = sent_input_size
+        
+        # Price LSTM 
+        self.price_lstm = nn.LSTM(
+            price_input_size,
+            lstm_hidden,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+        # Sentiment LSTM 
+        self.sent_lstm = nn.LSTM(
+            sent_input_size,
+            lstm_hidden,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+
+        dirs = 2 if bidirectional else 1
+        combined_size = lstm_hidden * dirs * num_lstm_layers * 2
+
+        # Fusion head: one dense layer + dropout - The manager 
+        self.fc1 = nn.Linear(combined_size, dense_hidden)
+        self.dropout = nn.Dropout(dropout) # to not memorize the training data
+        self.relu = nn.ReLU()
+        self.out = nn.Linear(dense_hidden, 1)
+
+    def forward(self, x):
+        # Dynamically split based on input size
+        p = x[:, :, :self.price_input_size]
+        s = x[:, :, self.price_input_size:]
+        
+
+        _, (hp, _) = self.price_lstm(p)
+        _, (hs, _) = self.sent_lstm(s)
+
+        # for bidirectional LSTM, concatenate the forward and backward states
+        batch_size = p.size(0)
+        p_last = hp.permute(1, 0, 2).reshape(batch_size, -1)
+        s_last = hs.permute(1, 0, 2).reshape(batch_size, -1)
+        # fuse 
+        h = torch.cat([p_last, s_last], dim=1)
+        
+        # Pass through fusion head
+        h = self.relu(self.fc1(h))
+        h = self.dropout(h)
+        return self.out(h)
+
+PRICE_FEATURES_COUNT = 3  # Close, Volume, SMA_10
+SENT_FEATURES_COUNT = 4   # neg, neu, pos, comp
+
+model = TwoStreamFusion(
+    price_input_size=PRICE_FEATURES_COUNT,
+    sent_input_size=SENT_FEATURES_COUNT,
+    lstm_hidden=32,
+    dense_hidden=32,
+    dropout=0.5,
+    num_lstm_layers=1,
+    bidirectional=False
+).to(device)
+
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+
+
+
+print(model)
+history = {
+    'train_mse': [],
+    'val_mse': []
+}
+
+best_val_mse = float('inf')
+
+for epoch in range(1, 101):
+    # Training phase
+    model.train()
+    train_loss_total = 0.0
+    num_train_samples = 0
+
+    for xb, yb in train_loader:
+        optimizer.zero_grad()
+        pred = model(xb)
+        loss = criterion(pred, yb)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        train_loss_total += loss.item() * xb.size(0)
+        num_train_samples += xb.size(0)
+
+    train_mse = train_loss_total / num_train_samples
+
+    # Validation phase
+    model.eval()
+    val_loss_total = 0.0
+    num_val_samples = 0
+
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            val_loss_total += loss.item() * xb.size(0)
+            num_val_samples += xb.size(0)
+
+    val_mse = val_loss_total / num_val_samples
+
+    history['train_mse'].append(train_mse)
+    history['val_mse'].append(val_mse)
+
+    scheduler.step(val_mse)
+
+    if val_mse < best_val_mse:
+        best_val_mse = val_mse
+        torch.save(model.state_dict(), 'best_model.pth')
+
+    if epoch % 10 == 0:
+        print(
+            f"Epoch {epoch:03d} | "
+            f"Train MSE: {train_mse:.6f} | "
+            f"Val MSE: {val_mse:.6f}"
+        )
+
+print("Training complete.")
