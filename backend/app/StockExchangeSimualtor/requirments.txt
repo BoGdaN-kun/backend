@@ -1,7 +1,0 @@
-Flask
-Flask-SQLAlchemy
-Flask-CORS
-Flask-JWT-Extended
-requests
-pydantic
-python-dotenv
