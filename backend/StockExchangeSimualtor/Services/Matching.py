@@ -50,6 +50,7 @@ def _update_cash_balance(user_id: int, amount_cents: int, action: str):
 
 def fetch_latest_price(symbol: str) -> int:
     url = current_app.config["MARKET_FEED_URL"]
+    url = f"{url}?symbol={symbol.upper()}&limit=1"
     resp = requests.get(url)
     if resp.status_code != 200:
         current_app.logger.error(f"Market-feed returned {resp.status_code} for {symbol}: {resp.text}")

@@ -19,7 +19,7 @@ class BaseConfig:
     # URL to your Market-Feed service (returns latest 1s candle)
     MARKET_FEED_URL = os.environ.get(
         "MARKET_FEED_URL",
-        "http://localhost:8000/candles?limit=1"
+        "http://localhost:8000/candles"
     )
     print("→ SQLALCHEMY_DATABASE_URI is:", SQLALCHEMY_DATABASE_URI)
 

@@ -82,7 +82,7 @@ function LiveChartLW({bootstrapEndpoint, pollEndpoint, pollMs = 2000, height = 4
     const pollingTimerRef = useRef(null);
 
     const toLWFormat = useCallback(c => ({
-        time: c.time,
+        time: parseInt(c.time, 10),
         open: parseFloat(c.open),
         high: parseFloat(c.high),
         low: parseFloat(c.low),
@@ -121,9 +121,11 @@ function LiveChartLW({bootstrapEndpoint, pollEndpoint, pollMs = 2000, height = 4
             try {
                 const response = await fetch(bootstrapEndpoint);
                 const data = (await response.json()).map(toLWFormat);
+                console.log("Formatted candles for chart:", data);
                 if (isMounted) {
                     seriesRef.current.setData(data);
                 }
+
             } catch (err) {
                 console.error('Bootstrap error:', err);
             }
@@ -192,18 +194,18 @@ function ChartContainer({stockSymbol}) {
     const [timeRange, setTimeRange] = useState('LIVE');
     const [chartKey, setChartKey] = useState(Date.now());
     const [chartConfig, setChartConfig] = useState({
-        bootstrapEndpoint: `${API_BASE_URL_MARKET_DATA}/today?symbol=${stockSymbol}`,
+        bootstrapEndpoint: `${API_BASE_URL_MARKET_DATA}/today/${stockSymbol}`,
         pollEndpoint: `${API_BASE_URL_MARKET_DATA}/candles?symbol=${stockSymbol}&limit=5`,
         pollMs: 2000
     });
-
+    console.log(`${API_BASE_URL_MARKET_DATA}/today/${stockSymbol}`);
     const handleTimeRangeChange = (range) => {
         setTimeRange(range);
         setChartKey(Date.now());
 
         if (range === 'LIVE') {
             setChartConfig({
-                bootstrapEndpoint: `${API_BASE_URL_MARKET_DATA}/today?symbol=${stockSymbol}`,
+                bootstrapEndpoint: `${API_BASE_URL_MARKET_DATA}/today/${stockSymbol}`,
                 pollEndpoint: `${API_BASE_URL_MARKET_DATA}/candles?symbol=${stockSymbol}&limit=5`,
                 pollMs: 2000
             });
